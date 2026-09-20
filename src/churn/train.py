@@ -81,9 +81,9 @@ def _model_configs() -> list[dict[str, Any]]:
         {
             "run_name": "logistic_regression_c0.1",
             "family": "logistic_regression",
-            "params": {"C": 0.1, "penalty": "l2", "max_iter": 1000, "solver": "lbfgs"},
+            "params": {"C": 0.1, "max_iter": 1000, "solver": "lbfgs"},
             "estimator": LogisticRegression(
-                C=0.1, penalty="l2", max_iter=1000, solver="lbfgs", random_state=42
+                C=0.1, max_iter=1000, solver="lbfgs", random_state=42
             ),
         },
         {

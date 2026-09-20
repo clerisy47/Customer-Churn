@@ -9,12 +9,9 @@ from typing import Any
 import mlflow
 import numpy as np
 import pandas as pd
-from evidently import Report
-from evidently.metrics import (
-    DatasetDriftMetric,
-    ValueDrift,
-)
-from evidently.presets import DataDriftPreset, DataSummaryPreset
+from evidently import Dataset, DataDefinition, Report
+from evidently.metrics import DriftedColumnsCount, MeanValue, ValueDrift
+from evidently.presets import DataDriftPreset
 from sklearn.model_selection import train_test_split
 
 from churn.config import (
@@ -27,42 +24,95 @@ from churn.config import (
     TRACKING_URI,
 )
 from churn.data import TARGET_COL, load_clean
-
-# Evidently 0.7+ API varies; try classic Report/metrics with fallbacks below.
+from churn.evidently_metrics import MonthlyChargesMeanAbsDiff
+from churn.features import NUMERIC_FEATURES
 
 
 def _inject_drift(current: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
     """Deliberately perturb current data so drift reports have something to flag."""
     out = current.copy()
 
-    # Numeric noise on MonthlyCharges and tenure
-    out["MonthlyCharges"] = out["MonthlyCharges"] + rng.normal(loc=25.0, scale=8.0, size=len(out))
+    out["MonthlyCharges"] = out["MonthlyCharges"] + rng.normal(
+        loc=25.0, scale=8.0, size=len(out)
+    )
     out["MonthlyCharges"] = out["MonthlyCharges"].clip(lower=0)
     out["tenure"] = out["tenure"] + rng.integers(low=6, high=18, size=len(out))
     out["tenure"] = out["tenure"].clip(lower=0, upper=72)
 
-    # Skew Contract toward Month-to-month
     n_force = max(1, int(0.45 * len(out)))
     force_idx = rng.choice(out.index.to_numpy(), size=n_force, replace=False)
     out.loc[force_idx, "Contract"] = "Month-to-month"
 
-    # Flip a share of labels (concept / label drift)
-    n_flip = max(1, int(0.08 * len(out)))
+    # Flip a larger share of labels so target drift is clearly detectable
+    n_flip = max(1, int(0.20 * len(out)))
     flip_idx = rng.choice(out.index.to_numpy(), size=n_flip, replace=False)
     out.loc[flip_idx, TARGET_COL] = 1 - out.loc[flip_idx, TARGET_COL]
 
     return out
 
 
-def _monthly_charges_mean_diff(reference: pd.DataFrame, current: pd.DataFrame) -> float:
-    """Custom metric: |mean(MonthlyCharges_current) - mean(MonthlyCharges_reference)|."""
-    return float(abs(current["MonthlyCharges"].mean() - reference["MonthlyCharges"].mean()))
+def _data_definition(include_target: bool = False) -> DataDefinition:
+    categorical = [
+        c
+        for c in [
+            "gender",
+            "Partner",
+            "Dependents",
+            "PhoneService",
+            "MultipleLines",
+            "InternetService",
+            "OnlineSecurity",
+            "OnlineBackup",
+            "DeviceProtection",
+            "TechSupport",
+            "StreamingTV",
+            "StreamingMovies",
+            "Contract",
+            "PaperlessBilling",
+            "PaymentMethod",
+        ]
+    ]
+    numerical = list(NUMERIC_FEATURES)
+    if include_target:
+        numerical = numerical + [TARGET_COL]
+    return DataDefinition(numerical_columns=numerical, categorical_columns=categorical)
+
+
+def _to_dataset(df: pd.DataFrame, include_target: bool = False) -> Dataset:
+    frame = df if include_target else df.drop(columns=[TARGET_COL])
+    return Dataset.from_pandas(frame, data_definition=_data_definition(include_target))
+
+
+def _parse_drifted_columns(metrics_json: list[dict[str, Any]]) -> tuple[list[str], bool]:
+    drifted: list[str] = []
+    dataset_drift = False
+    for metric in metrics_json:
+        name = metric.get("metric_name", "")
+        value = metric.get("value")
+        config = metric.get("config", {})
+        if name.startswith("DriftedColumnsCount"):
+            if isinstance(value, dict) and value.get("count", 0) > 0:
+                dataset_drift = True
+            continue
+        if name.startswith("ValueDrift") and "column" in config:
+            threshold = float(config.get("threshold", 0.05))
+            method = str(config.get("method", "")).lower()
+            try:
+                score = float(value)
+            except (TypeError, ValueError):
+                continue
+            # p-value methods: drift when p < threshold
+            # distance methods (Wasserstein, Jensen-Shannon, etc.): drift when score > threshold
+            is_pvalue = "p_value" in method or "p-value" in method or "pvalue" in method
+            drifted_flag = score < threshold if is_pvalue else score > threshold
+            if drifted_flag:
+                drifted.append(config["column"])
+    return sorted(set(drifted)), dataset_drift or bool(drifted)
 
 
 def _contract_segment_churn_shift(
     reference: pd.DataFrame, current: pd.DataFrame
 ) -> float:
-    """Custom metric: churn-rate delta within Contract == Month-to-month."""
     ref_seg = reference[reference["Contract"] == "Month-to-month"]
     cur_seg = current[current["Contract"] == "Month-to-month"]
     ref_rate = float(ref_seg[TARGET_COL].mean()) if len(ref_seg) else 0.0
@@ -70,100 +120,68 @@ def _contract_segment_churn_shift(
     return float(abs(cur_rate - ref_rate))
 
 
-def _build_evidently_reports(
+def _build_reports(
     reference: pd.DataFrame, current: pd.DataFrame
-) -> tuple[Path, Path, dict[str, Any]]:
-    """Generate data-drift and target-drift HTML reports; return paths + summary bits."""
+) -> tuple[Path, Path, dict[str, Any], float]:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     drift_html = REPORTS_DIR / "drift_report.html"
     target_html = REPORTS_DIR / "target_drift_report.html"
 
-    drifted_columns: list[str] = []
-    dataset_drift = False
+    ref_feat = _to_dataset(reference, include_target=False)
+    cur_feat = _to_dataset(current, include_target=False)
 
-    # --- Data drift report (features only) ---
-    ref_feat = reference.drop(columns=[TARGET_COL])
-    cur_feat = current.drop(columns=[TARGET_COL])
+    data_report = Report(
+        [
+            DataDriftPreset(),
+            DriftedColumnsCount(),
+            MeanValue(column="MonthlyCharges"),
+            MonthlyChargesMeanAbsDiff(
+                column="MonthlyCharges",
+                threshold=MONTHLY_CHARGES_MEAN_DIFF_THRESHOLD,
+            ),
+        ]
+    )
+    data_snap = data_report.run(cur_feat, ref_feat)
+    data_snap.save_html(str(drift_html))
+    data_metrics = json.loads(data_snap.json())["metrics"]
 
-    try:
-        from evidently.report import Report as LegacyReport
-        from evidently.metric_preset import DataDriftPreset as LegacyDataDriftPreset
-        from evidently.metric_preset import TargetDriftPreset as LegacyTargetDriftPreset
-        from evidently.metrics import ColumnDriftMetric
+    drifted_columns, dataset_drift = _parse_drifted_columns(data_metrics)
 
-        data_report = LegacyReport(metrics=[LegacyDataDriftPreset()])
-        data_report.run(reference_data=ref_feat, current_data=cur_feat)
-        data_report.save_html(str(drift_html))
+    # Extract custom metric value from report JSON
+    custom_mean_diff = None
+    for metric in data_metrics:
+        if "MonthlyChargesMeanAbsDiff" in metric.get("metric_name", "") or (
+            metric.get("config", {}).get("type", "").endswith("MonthlyChargesMeanAbsDiff")
+        ):
+            try:
+                custom_mean_diff = float(metric["value"])
+            except (TypeError, ValueError, KeyError):
+                pass
+            break
+    if custom_mean_diff is None:
+        custom_mean_diff = float(
+            abs(current["MonthlyCharges"].mean() - reference["MonthlyCharges"].mean())
+        )
 
-        result = data_report.as_dict()
-        # Parse drifted columns from metrics payload when available
-        for metric in result.get("metrics", []):
-            metric_result = metric.get("result", {})
-            if "drift_by_columns" in metric_result:
-                for col, info in metric_result["drift_by_columns"].items():
-                    if info.get("drift_detected"):
-                        drifted_columns.append(col)
-            if metric_result.get("dataset_drift") is True:
-                dataset_drift = True
-            # DatasetDriftMetric-style
-            if "number_of_drifted_columns" in metric_result:
-                dataset_drift = metric_result.get("dataset_drift", dataset_drift)
+    # Target drift report
+    ref_full = _to_dataset(reference, include_target=True)
+    cur_full = _to_dataset(current, include_target=True)
+    target_report = Report([ValueDrift(column=TARGET_COL, threshold=0.05)])
+    target_snap = target_report.run(cur_full, ref_full)
+    target_snap.save_html(str(target_html))
+    target_metrics = json.loads(target_snap.json())["metrics"]
+    target_drifted, _ = _parse_drifted_columns(target_metrics)
+    drifted_columns = sorted(set(drifted_columns) | set(target_drifted))
 
-        target_report = LegacyReport(metrics=[LegacyTargetDriftPreset()])
-        # TargetDriftPreset expects target column present
-        target_report.run(reference_data=reference, current_data=current)
-        target_report.save_html(str(target_html))
-
-        # Also check target column drift explicitly
-        col_report = LegacyReport(metrics=[ColumnDriftMetric(column_name=TARGET_COL)])
-        col_report.run(reference_data=reference, current_data=current)
-        col_dict = col_report.as_dict()
-        for metric in col_dict.get("metrics", []):
-            if metric.get("result", {}).get("drift_detected"):
-                drifted_columns.append(TARGET_COL)
-
-    except Exception:
-        # Evidently 0.7+ preset API
-        data_report = Report([DataDriftPreset(), DataSummaryPreset()])
-        snapshot = data_report.run(cur_feat, ref_feat)
-        snapshot.save_html(str(drift_html))
-
-        # Minimal target comparison HTML via ValueDrift if available
-        try:
-            target_report = Report([ValueDrift(column=TARGET_COL), DatasetDriftMetric()])
-            t_snap = target_report.run(current, reference)
-            t_snap.save_html(str(target_html))
-        except Exception:
-            # Fallback: write a simple HTML summarizing target rates
-            ref_rate = float(reference[TARGET_COL].mean())
-            cur_rate = float(current[TARGET_COL].mean())
-            target_html.write_text(
-                "<html><body>"
-                "<h1>Target Drift Summary</h1>"
-                f"<p>Reference churn rate: {ref_rate:.4f}</p>"
-                f"<p>Current churn rate: {cur_rate:.4f}</p>"
-                f"<p>Absolute shift: {abs(cur_rate - ref_rate):.4f}</p>"
-                "</body></html>"
-            )
-            if abs(cur_rate - ref_rate) > 0.02:
-                drifted_columns.append(TARGET_COL)
-
-        # Heuristic: mark injected features as drifted when means/distributions moved
-        if abs(current["MonthlyCharges"].mean() - reference["MonthlyCharges"].mean()) > 5:
-            drifted_columns.append("MonthlyCharges")
-        if abs(current["tenure"].mean() - reference["tenure"].mean()) > 2:
-            drifted_columns.append("tenure")
-        ref_m2m = (reference["Contract"] == "Month-to-month").mean()
-        cur_m2m = (current["Contract"] == "Month-to-month").mean()
-        if abs(cur_m2m - ref_m2m) > 0.05:
-            drifted_columns.append("Contract")
-        dataset_drift = len(drifted_columns) > 0
-
-    drifted_columns = sorted(set(drifted_columns))
-    return drift_html, target_html, {
-        "drifted_columns": drifted_columns,
-        "dataset_drift": bool(dataset_drift or drifted_columns),
-    }
+    return (
+        drift_html,
+        target_html,
+        {
+            "drifted_columns": drifted_columns,
+            "dataset_drift": bool(dataset_drift or drifted_columns),
+        },
+        custom_mean_diff,
+    )
 
 
 def run_monitoring() -> dict[str, Any]:
@@ -182,17 +200,14 @@ def run_monitoring() -> dict[str, Any]:
     rng = np.random.default_rng(RANDOM_STATE)
     current_drifted = _inject_drift(current, rng)
 
-    mean_diff = _monthly_charges_mean_diff(reference, current_drifted)
-    segment_shift = _contract_segment_churn_shift(reference, current_drifted)
-
-    drift_html, target_html, drift_info = _build_evidently_reports(
+    drift_html, target_html, drift_info, mean_diff = _build_reports(
         reference, current_drifted
     )
+    segment_shift = _contract_segment_churn_shift(reference, current_drifted)
 
     injected_flagged = [
         c for c in INJECTED_DRIFT_FEATURES if c in drift_info["drifted_columns"]
     ]
-    # Also count as significant if custom metric exceeds threshold
     custom_triggered = mean_diff >= MONTHLY_CHARGES_MEAN_DIFF_THRESHOLD
     significant_drift = bool(
         drift_info["dataset_drift"]
@@ -211,10 +226,11 @@ def run_monitoring() -> dict[str, Any]:
 - `MonthlyCharges`: shifted by ~N(25, 8) noise per row.
 - `tenure`: increased by a random integer offset in [6, 18].
 - `Contract`: ~45% of current rows forced to `Month-to-month`.
-- `Churn`: ~8% of labels flipped to simulate concept/label drift.
+- `Churn`: ~20% of labels flipped to simulate concept/label drift.
 
 ## Custom metrics
-- Absolute mean difference in `MonthlyCharges`: **{mean_diff:.3f}** (threshold={MONTHLY_CHARGES_MEAN_DIFF_THRESHOLD}).
+- Absolute mean difference in `MonthlyCharges` (Evidently custom metric): **{mean_diff:.3f}**
+  (threshold={MONTHLY_CHARGES_MEAN_DIFF_THRESHOLD}).
 - Absolute churn-rate shift within `Contract == Month-to-month`: **{segment_shift:.4f}**.
 
 ## Detected drift
@@ -247,7 +263,9 @@ and re-evaluate before promoting a new Production model.
             "target_drift_report_html": str(target_html),
             "interpretation_md": str(interpretation_path),
         },
-        "recommendation": "RETRAIN RECOMMENDED" if significant_drift else "NO RETRAIN NEEDED",
+        "recommendation": (
+            "RETRAIN RECOMMENDED" if significant_drift else "NO RETRAIN NEEDED"
+        ),
     }
     summary_path = REPORTS_DIR / "drift_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))

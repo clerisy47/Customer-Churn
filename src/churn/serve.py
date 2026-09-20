@@ -66,7 +66,7 @@ def _load_production_model() -> tuple[Any, str | None]:
     model = mlflow.sklearn.load_model(MODEL_URI)
     client = MlflowClient()
     versions = client.get_latest_versions(REGISTERED_MODEL_NAME, stages=["Production"])
-    version = versions[0].version if versions else None
+    version = str(versions[0].version) if versions else None
     return model, version
 
 
