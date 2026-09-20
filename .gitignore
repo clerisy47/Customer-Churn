@@ -1,0 +1,33 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# MLflow
+mlruns/
+mlartifacts/
+*.db
+
+# Local reports / artifacts (generated)
+reports/*.html
+reports/*.png
+reports/*.json
+reports/*.md
+reports/*.csv
+!reports/.gitkeep
+
+# Airflow
+airflow/logs/
+airflow/airflow.db
+airflow/airflow.cfg
+airflow/webserver_config.py
+airflow/*.cfg
+
+.DS_Store
+.env
+*.log
