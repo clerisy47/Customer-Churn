@@ -1,0 +1,26 @@
+{
+  "significant_drift": true,
+  "dataset_drift": true,
+  "drifted_columns": [
+    "Churn",
+    "Contract",
+    "MonthlyCharges",
+    "tenure"
+  ],
+  "injected_features_flagged": [
+    "MonthlyCharges",
+    "tenure",
+    "Contract"
+  ],
+  "custom_metrics": {
+    "monthly_charges_mean_abs_diff": 24.407625971037803,
+    "monthly_charges_mean_diff_threshold": 5.0,
+    "month_to_month_churn_rate_abs_shift": 0.02749785234501706
+  },
+  "artifacts": {
+    "drift_report_html": "reports/drift_report.html",
+    "target_drift_report_html": "reports/target_drift_report.html",
+    "interpretation_md": "reports/interpretation.md"
+  },
+  "recommendation": "RETRAIN RECOMMENDED"
+}

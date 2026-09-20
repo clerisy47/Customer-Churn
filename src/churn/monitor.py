@@ -18,6 +18,7 @@ from churn.config import (
     INJECTED_DRIFT_FEATURES,
     MONITOR_EXPERIMENT_NAME,
     MONTHLY_CHARGES_MEAN_DIFF_THRESHOLD,
+    PROJECT_ROOT,
     RANDOM_STATE,
     REFERENCE_FRAC,
     REPORTS_DIR,
@@ -259,9 +260,9 @@ and re-evaluate before promoting a new Production model.
             "month_to_month_churn_rate_abs_shift": segment_shift,
         },
         "artifacts": {
-            "drift_report_html": str(drift_html),
-            "target_drift_report_html": str(target_html),
-            "interpretation_md": str(interpretation_path),
+            "drift_report_html": str(drift_html.relative_to(PROJECT_ROOT)),
+            "target_drift_report_html": str(target_html.relative_to(PROJECT_ROOT)),
+            "interpretation_md": str(interpretation_path.relative_to(PROJECT_ROOT)),
         },
         "recommendation": (
             "RETRAIN RECOMMENDED" if significant_drift else "NO RETRAIN NEEDED"

@@ -13,14 +13,6 @@ mlruns/
 mlartifacts/
 *.db
 
-# Local reports / artifacts (generated)
-reports/*.html
-reports/*.png
-reports/*.json
-reports/*.md
-reports/*.csv
-!reports/.gitkeep
-
 # Airflow
 airflow/logs/
 airflow/airflow.db

@@ -1,0 +1,12 @@
+{
+  "best_run_id": "54dbc304651943b586ef76cb236fa0ae",
+  "best_run_name": "gradient_boosting_deeper",
+  "best_roc_auc": 0.8391878180472224,
+  "best_f1": 0.5755813953488372,
+  "registered_model": "telco-churn-classifier",
+  "model_version": 1,
+  "stages": [
+    "Staging",
+    "Production"
+  ]
+}
